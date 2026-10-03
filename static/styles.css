@@ -121,6 +121,12 @@ label code { color: var(--primary-dark); }
 .progress-step.error { color: var(--danger); border-color: #f3c7c2; background: var(--danger-soft); }
 .progress-step.error b { color: white; background: var(--danger); }
 .progress-step.skipped { opacity: .55; }
+.stream-output { margin-top: 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-soft); }
+.stream-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; padding: 7px 10px; color: var(--muted); border-bottom: 1px solid var(--line); font-size: 11px; font-variant-numeric: tabular-nums; }
+.stream-meta span:first-child { color: var(--primary-dark); font-weight: 600; }
+.stream-output pre { min-height: 0; max-height: 220px; padding: 9px 10px; border: 0; border-radius: 0 0 6px 6px; background: transparent; white-space: pre-wrap; word-break: break-all; }
+.stream-output.finished pre { max-height: 110px; }
+.stream-output pre:empty::before { content: "等待模型输出……"; color: var(--muted); }
 
 .message { margin-top: 14px; padding: 11px 13px; border: 1px solid; border-radius: 7px; font-size: 12px; }
 .message.error { color: var(--danger); background: var(--danger-soft); border-color: #f3c7c2; }

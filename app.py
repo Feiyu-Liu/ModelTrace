@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import secrets
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
-from enrollment import bank_summary, enroll_automatic, request_completion, test_automatic
+from enrollment import (
+    bank_summary,
+    enroll_automatic,
+    minimum_numbers,
+    request_completion,
+    stream_completion,
+    test_automatic,
+)
 from fingerprint import analyze_global_outputs, generate_challenges, load_bank, parse_numbers
 from bank_builder import build_bank, read_rows
 
@@ -213,19 +219,54 @@ def automatic_test_probe():
             temperature=requested_temperature(payload),
             api_format="auto",
         )
-        expected_count = int(payload["expected_count"])
-        parsed_numbers = len(parse_numbers(text))
-        minimum_numbers = max(80, math.ceil(expected_count * 0.55))
-        return jsonify(
-            {
-                "text": text,
-                "parsed_numbers": parsed_numbers,
-                "minimum_numbers": minimum_numbers,
-                "accepted": parsed_numbers >= minimum_numbers,
-            }
-        )
+        return jsonify(probe_result(text, int(payload["expected_count"])))
     except Exception as error:
         return jsonify({"error": str(error)}), 502
+
+
+def probe_result(text: str, expected_count: int) -> dict:
+    parsed_numbers = len(parse_numbers(text))
+    minimum = minimum_numbers(expected_count)
+    return {
+        "text": text,
+        "parsed_numbers": parsed_numbers,
+        "minimum_numbers": minimum,
+        "accepted": parsed_numbers >= minimum,
+    }
+
+
+@app.post("/api/test/probe/stream")
+def automatic_test_probe_stream():
+    payload = request.get_json()
+
+    def generate():
+        def line(event: dict) -> str:
+            return json.dumps(event, ensure_ascii=False) + "\n"
+
+        try:
+            events = stream_completion(
+                base_url=payload["base_url"].strip(),
+                api_key=payload["api_key"],
+                api_model=payload["api_model"].strip(),
+                prompt=payload["prompt"],
+                temperature=requested_temperature(payload),
+                api_format="auto",
+            )
+            while True:
+                try:
+                    yield line(next(events))
+                except StopIteration as finished:
+                    text = finished.value
+                    break
+            yield line({"type": "result", **probe_result(text, int(payload["expected_count"]))})
+        except Exception as error:
+            yield line({"type": "error", "message": str(error)})
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/bank")
