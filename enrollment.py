@@ -154,6 +154,10 @@ def enroll_manual(
     }
 
 
+# 自动探测时依次尝试的接口格式
+AUTO_FORMATS = ("responses", "openai", "anthropic")
+
+
 def completion_url(base_url: str, api_format: str = "openai") -> str:
     normalized = base_url.rstrip("/")
     if api_format == "anthropic":
@@ -162,6 +166,12 @@ def completion_url(base_url: str, api_format: str = "openai") -> str:
         if normalized.endswith("/v1"):
             return normalized + "/messages"
         return normalized + "/v1/messages"
+    if api_format == "responses":
+        if normalized.endswith("/responses"):
+            return normalized
+        if normalized.endswith("/v1"):
+            return normalized + "/responses"
+        return normalized + "/v1/responses"
     if normalized.endswith("/chat/completions"):
         return normalized
     if normalized.endswith("/v1"):
@@ -177,10 +187,19 @@ def _looks_like_waf_block(text: str) -> bool:
     )
 
 
+def _read_error_body(error: urllib.error.HTTPError) -> str:
+    try:
+        return error.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def _compact_upstream_error(details: str, fallback: str) -> str:
     text = (details or fallback or "").strip()
     if not text:
         return "上游接口返回错误"
+    if "a timeout occurred" in text.lower() or "error code 524" in text.lower():
+        return "上游网关等待模型响应超时（Cloudflare 524）"
     if _looks_like_waf_block(text):
         return (
             "请求被上游网关拦截（Cloudflare/WAF 拦截页）。"
@@ -203,7 +222,11 @@ def _compact_upstream_error(details: str, fallback: str) -> str:
     return text[:500]
 
 
-def _request_completion(
+def minimum_numbers(expected_count: int) -> int:
+    return max(80, math.ceil(expected_count * 0.55))
+
+
+def _build_request(
     base_url: str,
     api_key: str,
     api_model: str,
@@ -211,7 +234,8 @@ def _request_completion(
     temperature: float | None,
     api_format: str,
     system_prompt: str = "",
-) -> str:
+    stream: bool = False,
+) -> tuple[str, dict, bytes]:
     if api_format == "anthropic":
         body_data = {
             "model": api_model,
@@ -224,6 +248,16 @@ def _request_completion(
             "x-api-key": api_key,
             "Authorization": f"Bearer {api_key}",
             "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": upstream_user_agent(),
+        }
+    elif api_format == "responses":
+        body_data = {"model": api_model, "input": prompt, "store": False}
+        if system_prompt:
+            body_data["instructions"] = system_prompt
+        headers = {
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": upstream_user_agent(),
@@ -244,17 +278,101 @@ def _request_completion(
         }
     if temperature is not None:
         body_data["temperature"] = temperature
+    if stream:
+        body_data["stream"] = True
+        headers["Accept"] = "text/event-stream"
     body = json.dumps(body_data).encode("utf-8")
-    url = completion_url(base_url, api_format)
+    return completion_url(base_url, api_format), headers, body
+
+
+def _check_stop_reason(reason: str | None, api_format: str) -> None:
+    if api_format == "anthropic":
+        if reason == "refusal":
+            raise RuntimeError("模型拒绝生成，本次回答不计入")
+        if reason == "max_tokens":
+            raise RuntimeError("回答因 max_tokens 截断，本次回答不计入")
+    elif api_format == "responses":
+        if reason == "refusal":
+            raise RuntimeError("模型拒绝生成，本次回答不计入")
+        if reason:
+            raise RuntimeError(f"回答未正常完成（{reason}），本次回答不计入")
+    elif reason in {"length", "content_filter"}:
+        raise RuntimeError(f"回答未正常完成（{reason}），本次回答不计入")
+
+
+def _extract_content(payload: dict, api_format: str) -> str:
+    if api_format == "anthropic":
+        content = "".join(
+            block.get("text", "")
+            for block in payload["content"]
+            if block.get("type") == "text"
+        )
+        _check_stop_reason(payload.get("stop_reason"), api_format)
+    elif api_format == "responses":
+        content, reason = _responses_output(payload)
+        _check_stop_reason(reason, api_format)
+    else:
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content)
+        _check_stop_reason(choice.get("finish_reason"), api_format)
+    return str(content)
+
+
+def _responses_output(payload: dict) -> tuple[str, str | None]:
+    """从 Responses API 的 response 对象取出文本与未正常完成的原因。"""
+    status = payload.get("status")
+    if status == "failed":
+        error = payload.get("error") or {}
+        message = error.get("message") if isinstance(error, dict) else error
+        raise RuntimeError(f"上游生成失败：{message or status}")
+    texts = []
+    refused = False
+    for item in payload.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if part.get("type") == "output_text":
+                texts.append(part.get("text", ""))
+            elif part.get("type") == "refusal":
+                refused = True
+    content = "".join(texts) or payload.get("output_text") or ""
+    reason = None
+    if status == "incomplete":
+        reason = (payload.get("incomplete_details") or {}).get("reason") or "incomplete"
+    elif refused and not content:
+        reason = "refusal"
+    return str(content), reason
+
+
+def _request_completion(
+    base_url: str,
+    api_key: str,
+    api_model: str,
+    prompt: str,
+    temperature: float | None,
+    api_format: str,
+    system_prompt: str = "",
+) -> str:
+    # Responses 也以流式请求：长回答不会因网关空闲超时（如 Cloudflare 524）被切断
+    url, headers, body = _build_request(
+        base_url, api_key, api_model, prompt, temperature, api_format, system_prompt,
+        stream=api_format == "responses",
+    )
     payload = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=240) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                raw = response.read().decode("utf-8")
+            if _looks_like_sse(raw):
+                # 部分网关（如 Codex 中转）无论 stream 取值都返回 SSE，且未必标注 Content-Type
+                return "".join(_parse_sse(raw.splitlines(), api_format))
+            payload = json.loads(raw)
             break
         except urllib.error.HTTPError as error:
-            details = error.read().decode("utf-8", errors="replace").strip()
+            details = _read_error_body(error)
             message = _compact_upstream_error(details, error.reason)
             retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
             if attempt < MAX_ATTEMPTS and error.code in RETRYABLE_STATUS:
@@ -268,25 +386,184 @@ def _request_completion(
                 continue
             retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
             raise RuntimeError(f"无法连接接口：{reason}{retried}") from error
-    if api_format == "anthropic":
-        content = "".join(
-            block.get("text", "")
-            for block in payload["content"]
-            if block.get("type") == "text"
-        )
-        stop_reason = payload.get("stop_reason")
-        if stop_reason == "refusal":
-            raise RuntimeError("模型拒绝生成，本次回答不计入")
-        if stop_reason == "max_tokens":
-            raise RuntimeError("回答因 max_tokens 截断，本次回答不计入")
-    else:
-        choice = payload["choices"][0]
-        content = choice["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") for part in content)
-        if choice.get("finish_reason") in {"length", "content_filter"}:
-            raise RuntimeError(f"回答未正常完成（{choice['finish_reason']}），本次回答不计入")
-    return str(content)
+    return _extract_content(payload, api_format)
+
+
+class _StreamUnsupported(Exception):
+    """流式请求在收到任何内容前失败，可改用普通请求重试。"""
+
+
+def _looks_like_sse(text: str) -> bool:
+    return text.lstrip().startswith(("event:", "data:"))
+
+
+def _stream_events(response, api_format: str):
+    """读取上游响应，逐个 yield 文本增量。"""
+    content_type = response.headers.get("Content-Type", "")
+    if "text/event-stream" in content_type:
+        yield from _parse_sse(response, api_format)
+        return
+    # 上游忽略了 stream 参数直接返回完整 JSON，或返回了未标注类型的 SSE
+    raw = response.read().decode("utf-8")
+    if _looks_like_sse(raw):
+        yield from _parse_sse(raw.splitlines(), api_format)
+        return
+    yield _extract_content(json.loads(raw), api_format)
+
+
+def _parse_sse(lines, api_format: str):
+    """解析 SSE 行（bytes 或 str），逐个 yield 文本增量；结束时检查停止原因。"""
+    stop_reason = None
+    for raw in lines:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "error" or (api_format == "openai" and event.get("error")):
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else error
+            raise RuntimeError(f"上游流式输出错误：{message or data[:200]}")
+        if api_format == "responses":
+            kind = event.get("type", "")
+            if kind == "response.output_text.delta" and event.get("delta"):
+                yield event["delta"]
+            elif kind in {"response.completed", "response.incomplete", "response.failed"}:
+                _, stop_reason = _responses_output(event.get("response") or {})
+            elif kind == "response.refusal.done":
+                stop_reason = "refusal"
+        elif api_format == "anthropic":
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    yield delta["text"]
+            elif event.get("type") == "message_delta":
+                stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
+        else:
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            text = (choice.get("delta") or {}).get("content")
+            if isinstance(text, list):
+                text = "".join(part.get("text", "") for part in text)
+            if text:
+                yield text
+            stop_reason = choice.get("finish_reason") or stop_reason
+    _check_stop_reason(stop_reason, api_format)
+
+
+def _stream_format(
+    base_url: str,
+    api_key: str,
+    api_model: str,
+    prompt: str,
+    temperature: float | None,
+    api_format: str,
+    system_prompt: str = "",
+    expected_count: int | None = None,
+):
+    """以单一协议流式请求，yield 事件 dict，返回完整文本。
+
+    给定 expected_count 时，数字数量够了就主动断开，不再等模型自行结束。
+    """
+    url, headers, body = _build_request(
+        base_url, api_key, api_model, prompt, temperature, api_format, system_prompt, stream=True
+    )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        yield {"type": "status", "stage": "connecting", "format": api_format, "attempt": attempt}
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        received = False
+        try:
+            with urllib.request.urlopen(request, timeout=240) as response:
+                yield {"type": "status", "stage": "waiting", "format": api_format, "attempt": attempt}
+                text = ""
+                for chunk in _stream_events(response, api_format):
+                    if not received:
+                        received = True
+                        yield {"type": "status", "stage": "streaming", "format": api_format, "attempt": attempt}
+                    text += chunk
+                    parsed = len(parse_numbers(text))
+                    yield {"type": "delta", "text": chunk, "chars": len(text), "parsed": parsed}
+                    # 多等一个数字，确保第 expected_count 个数字已完整输出（后面出现了分隔）
+                    if expected_count and parsed > expected_count:
+                        yield {"type": "status", "stage": "enough", "format": api_format, "attempt": attempt}
+                        return text
+                return text
+        except urllib.error.HTTPError as error:
+            details = _read_error_body(error)
+            message = _compact_upstream_error(details, error.reason)
+            retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
+            if attempt < MAX_ATTEMPTS and error.code in RETRYABLE_STATUS:
+                yield {"type": "status", "stage": "retry", "format": api_format, "attempt": attempt, "message": f"HTTP {error.code}"}
+                yield {"type": "reset"}
+                time.sleep(RETRY_BASE_DELAY * attempt + random.uniform(0, 0.5))
+                continue
+            failure = RuntimeError(f"HTTP {error.code}: {message}{retried}")
+            if error.code in {401, 403, 404, 405}:
+                raise failure from error
+            raise _StreamUnsupported(str(failure)) from error
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            reason = getattr(error, "reason", str(error))
+            if attempt < MAX_ATTEMPTS:
+                yield {"type": "status", "stage": "retry", "format": api_format, "attempt": attempt, "message": str(reason)}
+                yield {"type": "reset"}
+                time.sleep(RETRY_BASE_DELAY * attempt + random.uniform(0, 0.5))
+                continue
+            retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
+            raise RuntimeError(f"无法连接接口：{reason}{retried}") from error
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+            if received:
+                raise RuntimeError(f"无法解析上游流式输出：{error}") from error
+            raise _StreamUnsupported(f"无法解析上游响应：{error}") from error
+
+
+def stream_completion(
+    base_url: str,
+    api_key: str,
+    api_model: str,
+    prompt: str,
+    temperature: float | None,
+    api_format: str = "auto",
+    system_prompt: str = "",
+    expected_count: int | None = None,
+):
+    """流式请求补全，yield 进度事件 dict，返回完整文本（通过 StopIteration.value）。"""
+    formats = AUTO_FORMATS if api_format == "auto" else (api_format,)
+    errors = []
+    for index, candidate in enumerate(formats):
+        if index:
+            yield {"type": "status", "stage": "format", "format": candidate}
+            yield {"type": "reset"}
+        try:
+            return (yield from _stream_format(
+                base_url, api_key, api_model, prompt, temperature, candidate, system_prompt,
+                expected_count,
+            ))
+        except _StreamUnsupported as stream_error:
+            yield {"type": "status", "stage": "fallback", "format": candidate, "message": str(stream_error)}
+            yield {"type": "reset"}
+            try:
+                text = _request_completion(
+                    base_url, api_key, api_model, prompt, temperature, candidate, system_prompt
+                )
+            except RuntimeError as error:
+                errors.append(f"{candidate}: {error}")
+                continue
+            yield {"type": "delta", "text": text, "chars": len(text), "parsed": len(parse_numbers(text))}
+            return text
+        except RuntimeError as error:
+            errors.append(f"{candidate}: {error}")
+    if len(formats) == 1:
+        raise RuntimeError(errors[0].split(": ", 1)[1])
+    raise RuntimeError("接口格式自动探测失败；" + "；".join(errors))
 
 
 def request_completion(
@@ -302,7 +579,7 @@ def request_completion(
         return _request_completion(
             base_url, api_key, api_model, prompt, temperature, api_format, system_prompt
         )
-    formats = ("openai", "anthropic")
+    formats = AUTO_FORMATS
     errors = []
     for candidate in formats:
         try:
@@ -337,8 +614,8 @@ def test_automatic(
                 temperature,
                 api_format,
             )
-            minimum = max(80, math.ceil(challenge["expected_count"] * 0.55))
-            parsed_count = len(parse_numbers(text))
+            minimum = minimum_numbers(challenge["expected_count"])
+            parsed_count = min(len(parse_numbers(text)), challenge["expected_count"])
             if parsed_count >= minimum:
                 outputs.append(
                     {

@@ -219,6 +219,9 @@ def analyze_outputs(outputs: list[dict], bank: dict) -> dict:
         text = str(item.get("text", ""))
         expected = int(item.get("expected_count") or 0)
         numbers = parse_numbers(text)
+        if expected:
+            # 只取题目要求的数量，避免超长/失控的回答放大权重
+            numbers = numbers[:expected]
         minimum = max(80, math.ceil(expected * 0.55)) if expected else 80
         accepted = len(numbers) >= minimum
         diagnostics.append(

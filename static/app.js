@@ -126,18 +126,105 @@ async function analyzeManual() {
   button.disabled = false;
 }
 
-function renderApiProgress(states, status) {
+function renderApiProgress(states, status, live = null) {
   const valid = states.filter((state) => state === "done").length;
   const attempted = states.filter((state) => ["done", "invalid", "error"].includes(state)).length;
   const target = 3;
+  const partial = live && valid < target ? Math.min(1, live.parsed / live.expected) : 0;
   byId("api-test-progress").hidden = false;
-  byId("api-progress-status").textContent = status;
+  if (status) byId("api-progress-status").textContent = status;
   byId("api-progress-count").textContent = `有效 ${valid}/${target} · 已尝试 ${attempted}/${states.length}`;
-  byId("api-progress-fill").style.width = `${(valid / target) * 100}%`;
+  byId("api-progress-fill").style.width = `${((valid + partial) / target) * 100}%`;
   byId("api-progress-steps").innerHTML = states.map((state, index) => {
     const labels = { pending: "等待", working: "请求中", done: "有效", invalid: "数字不足", error: "接口失败", skipped: "无需调用" };
-    return `<span class="progress-step ${state}"><b>${index + 1}</b>挑战 ${index + 1} · ${labels[state]}</span>`;
+    const label = state === "working" && live?.parsed ? `${labels[state]} · ${live.parsed} 个数字` : labels[state];
+    return `<span class="progress-step ${state}"><b>${index + 1}</b>挑战 ${index + 1} · ${label}</span>`;
   }).join("");
+}
+
+const STAGE_LABELS = {
+  connecting: (event) => `${event.attempt > 1 ? `第 ${event.attempt} 次连接` : "正在连接"}（${event.format} 格式）……`,
+  waiting: () => "已连接，等待首个 token……",
+  streaming: () => "模型正在输出……",
+  retry: (event) => `请求失败（${event.message}），准备重试……`,
+  format: (event) => `改用 ${event.format} 格式重新请求……`,
+  fallback: () => "流式请求失败，改用普通请求重试，等待完整回答……",
+  enough: () => "数字数量已足够，已停止接收",
+};
+
+async function readProbeStream(body, onEvent) {
+  const response = await fetch("/api/test/probe/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok || !response.body) throw new Error(`接口请求失败（HTTP ${response.status}）`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event.type === "result") return event;
+      if (event.type === "error") throw new Error(event.message || "接口请求失败");
+      onEvent(event);
+    }
+    if (done) throw new Error("连接意外中断，未收到完整结果");
+  }
+}
+
+function createStreamView(index, challenge) {
+  const panel = byId("api-stream");
+  const pre = byId("api-stream-text");
+  const view = { text: "", chars: 0, parsed: 0, started: Date.now(), firstToken: null, frame: 0, format: "" };
+  panel.hidden = false;
+  panel.classList.remove("finished");
+  pre.textContent = "";
+  const minimum = Math.max(80, Math.ceil(challenge.expected_count * 0.55));
+  const renderStats = () => {
+    const elapsed = ((Date.now() - view.started) / 1000).toFixed(0);
+    const first = view.firstToken === null ? "" : ` · 首 token ${((view.firstToken - view.started) / 1000).toFixed(1)}s`;
+    byId("api-stream-label").textContent = `尝试 ${index + 1} 实时输出${view.format ? ` · ${view.format}` : ""}`;
+    byId("api-stream-stats").textContent = `已接收 ${view.chars} 字符 · 已解析 ${view.parsed}/${challenge.expected_count} 个数字（需 ≥ ${minimum}）· 用时 ${elapsed}s${first}`;
+  };
+  const flush = () => {
+    view.frame = 0;
+    const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+    pre.textContent = view.text;
+    if (nearBottom) pre.scrollTop = pre.scrollHeight;
+    renderStats();
+  };
+  const timer = window.setInterval(renderStats, 1000);
+  renderStats();
+  return {
+    view,
+    handle(event) {
+      if (event.format) view.format = event.format;
+      if (event.type === "reset") {
+        Object.assign(view, { text: "", chars: 0, parsed: 0 });
+        pre.textContent = "";
+      } else if (event.type === "delta") {
+        if (view.firstToken === null) view.firstToken = Date.now();
+        view.text += event.text;
+        view.chars = event.chars;
+        view.parsed = event.parsed;
+        if (!view.frame) view.frame = window.requestAnimationFrame(flush);
+      }
+      renderStats();
+    },
+    finish() {
+      if (panel.classList.contains("finished")) return;
+      window.clearInterval(timer);
+      if (view.frame) window.cancelAnimationFrame(view.frame);
+      flush();
+      panel.classList.add("finished");
+    },
+  };
 }
 
 async function testViaApi(event) {
@@ -165,19 +252,21 @@ async function testViaApi(event) {
 
   for (let index = 0; index < challenges.length && outputs.length < target; index += 1) {
     states[index] = "working";
-    renderApiProgress(states, `正在进行第 ${index + 1} 次尝试，等待模型完整输出……`);
+    const attemptLabel = `第 ${index + 1} 次尝试`;
+    const live = { parsed: 0, expected: challenges[index].expected_count };
+    renderApiProgress(states, `${attemptLabel}：正在发送请求……`, live);
+    const stream = createStreamView(index, challenges[index]);
     try {
-      const response = await fetch("/api/test/probe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...configuration,
-          prompt: challenges[index].prompt,
-          expected_count: challenges[index].expected_count,
-        }),
+      const payload = await readProbeStream({
+        ...configuration,
+        prompt: challenges[index].prompt,
+        expected_count: challenges[index].expected_count,
+      }, (event) => {
+        stream.handle(event);
+        live.parsed = stream.view.parsed;
+        const stage = event.type === "status" && STAGE_LABELS[event.stage];
+        renderApiProgress(states, stage ? `${attemptLabel}：${stage(event)}` : null, live);
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "接口请求失败");
       if (payload.accepted) {
         outputs.push({ text: payload.text, expected_count: challenges[index].expected_count });
         states[index] = "done";
@@ -188,6 +277,10 @@ async function testViaApi(event) {
     } catch (error) {
       errors.push(`尝试 ${index + 1}: ${error.message}`);
       states[index] = "error";
+      stream.finish();
+      byId("api-stream-stats").textContent = `失败：${error.message}`;
+    } finally {
+      stream.finish();
     }
     renderApiProgress(states, `当前已有 ${outputs.length}/${target} 份有效回答`);
   }
@@ -219,6 +312,28 @@ async function testViaApi(event) {
     setMessage(byId("test-message"), result.error || "API 自动测试失败。", "error");
   }
   button.disabled = false;
+}
+
+const API_TEST_STORAGE_KEY = "modeltrace.apiTest";
+const API_TEST_FIELDS = ["test-api-base", "test-api-model", "test-api-key", "test-temperature"];
+
+function restoreApiTestConfig() {
+  let saved = {};
+  try {
+    saved = JSON.parse(window.localStorage.getItem(API_TEST_STORAGE_KEY)) || {};
+  } catch {
+    return;
+  }
+  API_TEST_FIELDS.forEach((id) => { if (typeof saved[id] === "string") byId(id).value = saved[id]; });
+}
+
+function saveApiTestConfig() {
+  const values = Object.fromEntries(API_TEST_FIELDS.map((id) => [id, byId(id).value]));
+  try {
+    window.localStorage.setItem(API_TEST_STORAGE_KEY, JSON.stringify(values));
+  } catch {
+    // 隐私模式等场景下 localStorage 不可用，忽略即可
+  }
 }
 
 function updateUnifiedSummary(summary) {
@@ -330,9 +445,11 @@ byId("bank-select").addEventListener("change", (event) => selectBank(event.targe
 byId("regenerate").addEventListener("click", loadChallenges);
 byId("analyze").addEventListener("click", analyzeManual);
 byId("api-test-form").addEventListener("submit", testViaApi);
+API_TEST_FIELDS.forEach((id) => byId(id).addEventListener("input", saveApiTestConfig));
 byId("auto-enrollment").addEventListener("submit", enrollAutomatically);
 byId("show-create-bank").addEventListener("click", () => { byId("create-bank-form").hidden = !byId("create-bank-form").hidden; });
 byId("create-bank-form").addEventListener("submit", createBank);
 
+restoreApiTestConfig();
 renderInventory();
 loadChallenges();
