@@ -468,8 +468,12 @@ def _stream_format(
     temperature: float | None,
     api_format: str,
     system_prompt: str = "",
+    expected_count: int | None = None,
 ):
-    """以单一协议流式请求，yield 事件 dict，返回完整文本。"""
+    """以单一协议流式请求，yield 事件 dict，返回完整文本。
+
+    给定 expected_count 时，数字数量够了就主动断开，不再等模型自行结束。
+    """
     url, headers, body = _build_request(
         base_url, api_key, api_model, prompt, temperature, api_format, system_prompt, stream=True
     )
@@ -486,12 +490,12 @@ def _stream_format(
                         received = True
                         yield {"type": "status", "stage": "streaming", "format": api_format, "attempt": attempt}
                     text += chunk
-                    yield {
-                        "type": "delta",
-                        "text": chunk,
-                        "chars": len(text),
-                        "parsed": len(parse_numbers(text)),
-                    }
+                    parsed = len(parse_numbers(text))
+                    yield {"type": "delta", "text": chunk, "chars": len(text), "parsed": parsed}
+                    # 多等一个数字，确保第 expected_count 个数字已完整输出（后面出现了分隔）
+                    if expected_count and parsed > expected_count:
+                        yield {"type": "status", "stage": "enough", "format": api_format, "attempt": attempt}
+                        return text
                 return text
         except urllib.error.HTTPError as error:
             details = _read_error_body(error)
@@ -529,6 +533,7 @@ def stream_completion(
     temperature: float | None,
     api_format: str = "auto",
     system_prompt: str = "",
+    expected_count: int | None = None,
 ):
     """流式请求补全，yield 进度事件 dict，返回完整文本（通过 StopIteration.value）。"""
     formats = AUTO_FORMATS if api_format == "auto" else (api_format,)
@@ -539,7 +544,8 @@ def stream_completion(
             yield {"type": "reset"}
         try:
             return (yield from _stream_format(
-                base_url, api_key, api_model, prompt, temperature, candidate, system_prompt
+                base_url, api_key, api_model, prompt, temperature, candidate, system_prompt,
+                expected_count,
             ))
         except _StreamUnsupported as stream_error:
             yield {"type": "status", "stage": "fallback", "format": candidate, "message": str(stream_error)}
@@ -609,7 +615,7 @@ def test_automatic(
                 api_format,
             )
             minimum = minimum_numbers(challenge["expected_count"])
-            parsed_count = len(parse_numbers(text))
+            parsed_count = min(len(parse_numbers(text)), challenge["expected_count"])
             if parsed_count >= minimum:
                 outputs.append(
                     {

@@ -149,6 +149,7 @@ const STAGE_LABELS = {
   retry: (event) => `请求失败（${event.message}），准备重试……`,
   format: (event) => `改用 ${event.format} 格式重新请求……`,
   fallback: () => "流式请求失败，改用普通请求重试，等待完整回答……",
+  enough: () => "数字数量已足够，已停止接收",
 };
 
 async function readProbeStream(body, onEvent) {

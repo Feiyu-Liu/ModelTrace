@@ -225,7 +225,8 @@ def automatic_test_probe():
 
 
 def probe_result(text: str, expected_count: int) -> dict:
-    parsed_numbers = len(parse_numbers(text))
+    # 分析时只取前 expected_count 个数字
+    parsed_numbers = min(len(parse_numbers(text)), expected_count)
     minimum = minimum_numbers(expected_count)
     return {
         "text": text,
@@ -251,6 +252,7 @@ def automatic_test_probe_stream():
                 prompt=payload["prompt"],
                 temperature=requested_temperature(payload),
                 api_format="auto",
+                expected_count=int(payload["expected_count"]),
             )
             while True:
                 try:
